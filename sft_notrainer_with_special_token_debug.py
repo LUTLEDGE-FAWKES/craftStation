@@ -13,23 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...)
-on a text file or a dataset without using HuggingFace Trainer.
-
-Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
-https://huggingface.co/models?filter=text-generation
-"""
-# You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import argparse
 import json
 import logging
 import math
 import os
+import copy
 import random
 from itertools import chain
+from functools import partial
 from pathlib import Path
+from typing import Dict
 
 import datasets
 import torch
@@ -50,6 +45,7 @@ from transformers import (
     AutoTokenizer,
     SchedulerType,
     default_data_collator,
+    DataCollatorForSeq2Seq,
     get_scheduler,
 )
 from transformers.utils import check_min_version, send_example_telemetry
@@ -66,7 +62,7 @@ require_version("datasets>=2.14.0", "To fix: pip install -r examples/pytorch/lan
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
+DEFAULT_PAD_TOKEN = '[PAD]'
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
@@ -127,6 +123,18 @@ def parse_args():
         type=float,
         default=0.1,
         help="The dropout rate of lora modules.",
+    )
+    parser.add_argument(
+        "--trainable",
+        type=str,
+        default="q_proj,v_proj",
+        help="lora target module",
+    )
+    parser.add_argument(
+        "--modules_to_save",
+        type=str,
+        default=None,
+        help="extra target module",
     )
     parser.add_argument(
         "--tokenizer_name",
@@ -268,6 +276,23 @@ def parse_args():
             "If passed, LLM loading time and RAM consumption will be benefited."
         ),
     )
+    parser.add_argument(
+        "--added_tokens",
+        type=str,
+        default=None,
+        help=(
+            "需要加入的的special token"
+        ),
+    )
+    parser.add_argument(
+        "--skip_tokens",
+        type=str,
+        default=None,
+        help=(
+            "训练时忽略的special token"
+        ),
+    )
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -283,26 +308,19 @@ def parse_args():
             if extension not in ["csv", "json", "txt"]:
                 raise ValueError("`validation_file` should be a csv, json or txt file.")
 
-    if args.push_to_hub:
-        if args.output_dir is None:
-            raise ValueError("Need an `output_dir` to create a repo when `--push_to_hub` is passed.")
-
     return args
 
 
+"""
+暂不支持从checkpoint恢复训练
+"""
 def main():
     args = parse_args()
     
     """
-    TODO 为llama模型添加猴子补丁，适配flash-attn或者添加其他功能
+    TODO 为模型添加猴子补丁，适配flash-attn或者添加其他功能
     """
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    # send_example_telemetry("run_clm_no_trainer", args) 一般为本地运行，不予使用
-    
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
+
     accelerator_log_kwargs = {}
 
     if args.with_tracking:
@@ -330,97 +348,22 @@ def main():
         set_seed(args.seed)
 
     # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.push_to_hub:
-            # Retrieve of infer repo_name
-            repo_name = args.hub_model_id
-            if repo_name is None:
-                repo_name = Path(args.output_dir).absolute().name
-            # Create repo and retrieve repo_id
-            api = HfApi()
-            repo_id = api.create_repo(repo_name, exist_ok=True, token=args.hub_token).repo_id
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
+    if accelerator.is_main_process and args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
-
-    """
-    加载数据集
-    """
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
-    else:
-        data_files = {}
-        dataset_args = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        raw_datasets = load_dataset("json", data_files=data_files, **dataset_args)
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                "json",
-                data_files=data_files,
-                split=f"train[:{args.validation_split_percentage}%]",
-                **dataset_args,
-            )
-            raw_datasets["train"] = load_dataset(
-                "json",
-                data_files=data_files,
-                split=f"train[{args.validation_split_percentage}%:]",
-                **dataset_args,
-            )
-
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.
 
 
     """
     初始化模型与分词器
     """
-    # Load pretrained model and tokenizer
-    #
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    if args.config_name:
-        config = AutoConfig.from_pretrained(args.config_name)
-    elif args.model_name_or_path:
+    if args.model_name_or_path:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
     else:
         raise ValueError(
             "You are instantiating a new config instance from scratch. This is not supported by this script."
         )
     
-    if args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
-    elif args.model_name_or_path:
+    if args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
         raise ValueError(
@@ -443,19 +386,68 @@ def main():
             "You are instantiating a new model from scratch, which is not recommended."
         )
     
-    """
-    # TODO 在此处扩充词表，可参考self-rag，注意llama默认没有设置pad token
-    """
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
-    
     """
-    # 在此处初始化LoRA
-    # TODO 根据hf的loraconfig文档实现更多功能，重点关注target_module，如果涉及到MOE，这点会更为重要
+    添加special token并扩充词表, 尽量确保reshape后emb形状为64倍数
+    """
+    # 参考自self-rag
+    def smart_tokenizer_and_embedding_resize(
+        special_tokens_dict: Dict,
+        tokenizer: transformers.PreTrainedTokenizer,
+        model: transformers.PreTrainedModel,
+    ):
+        """Resize tokenizer and embedding.
+        Note: This is the unoptimized version that may make your embedding size not be divisible by 64.
+        """
+        model_vocab_size = model.get_input_embeddings().num_embeddings
+        logger.warning("模型的词表大小: {}".format(model_vocab_size))
+        vocab_size_before = len(tokenizer)
+        num_new_tokens = tokenizer.add_special_tokens(special_tokens_dict)
+
+        # 如果词表大小超过模型的词表大小，需要调整模型的词表大小
+        # 当词表大小没有超过模型的词表大小时，不需要调整模型的词表大小（其实也可以调整，不会影响训练，但没有必要）
+        if num_new_tokens + vocab_size_before > model_vocab_size:
+            logger.warning("词表大小超过模型的词表大小，需要reshape embedding")
+            model.resize_token_embeddings(len(tokenizer))
+            if num_new_tokens > 0: # 初始化添加的embedding的权重，这里简单的取了已有embedding的均值
+                input_embeddings = model.get_input_embeddings().weight.data
+                output_embeddings = model.get_output_embeddings().weight.data
+
+                input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+                output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+                input_embeddings[-num_new_tokens:] = input_embeddings_avg
+                output_embeddings[-num_new_tokens:] = output_embeddings_avg
+        else:
+            logger.warning("词表大小没有超过模型的词表大小，不需要reshape embedding")
+
+        if accelerator.is_main_process:
+            logger.warning("调整前的词表大小: {}".format(vocab_size_before))
+            vocab_size_after = len(tokenizer)
+            logger.warning("调整后的词表大小: {}".format(vocab_size_after))
+            logger.warning("添加的special tokens 个数: {}".format(num_new_tokens))
+            new_token_ids = tokenizer.convert_tokens_to_ids(special_tokens_dict['additional_special_tokens'])
+            for token, token_id in zip(special_tokens_dict['additional_special_tokens'], new_token_ids):
+                logger.warning("添加的 special token: '{}', ID: {}".format(token, token_id))
+
+
+    if args.added_tokens is not None: 
+        special_token_dict = {
+            # "additional_special_tokens": ["QUERY_GENERATION", "TITLE_GENERATION"]}
+            "additional_special_tokens": args.added_tokens.split(',')}
+        if tokenizer.pad_token is None:
+            special_token_dict["pad_token"] = DEFAULT_PAD_TOKEN
+        smart_tokenizer_and_embedding_resize(
+            special_tokens_dict=special_token_dict,
+            tokenizer=tokenizer,
+            model=model,
+        )
+    else:
+        logger.warning('并没有传入任何special token，将根据原始词表进行训练')
+
+    """
+    # 初始化LoRA
+    # TODO 添加kwarg
     """
 
     if args.use_lora:
@@ -464,8 +456,9 @@ def main():
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM, 
             inference_mode=False, 
-            r=args.lora_rank, 
-            #modules_to_save=modules_to_save,
+            r=args.lora_rank,
+            target_modules=args.trainable.split(','),
+            modules_to_save=args.modules_to_save.split(','),
             lora_alpha=args.lora_alpha, 
             lora_dropout=args.lora_dropout
         )
@@ -473,93 +466,114 @@ def main():
         model.print_trainable_parameters()
 
     """
-    根据格式处理数据集，注意尽量保证扩展性
-    对于CLM任务，默认键为"text"的值或者第一个值为训练语料
-    # TODO 适配多轮对话数据，可参考medGPT
+    加载并处理数据集
     """
 
-    # Preprocessing the datasets.
-    # First we tokenize all the texts.
-    column_names = raw_datasets["train"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
+    data_files = {}
+    dataset_args = {}
+    if args.train_file is not None:
+        data_files["train"] = args.train_file
+    if args.validation_file is not None:
+        data_files["validation"] = args.validation_file
+    extension = (
+        args.train_file.split(".")[-1]
+        if args.train_file is not None
+        else args.validation_file.split(".")[-1]
+    )
+    raw_datasets = load_dataset(
+        extension,
+        data_files=data_files,
+        **dataset_args,
+    )
+    column_names = list(raw_datasets["train"].features)
 
-    def tokenize_function(examples):
-        return tokenizer(examples[text_column_name])
 
-    with accelerator.main_process_first():
-        tokenized_datasets = raw_datasets.map(
-            tokenize_function,
-            batched=True,
-            num_proc=args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not args.overwrite_cache,
-            desc="Running tokenizer on dataset",
+    def _tokenize_fn(text: str, tokenizer: transformers.AutoTokenizer, max_seq_length: int):
+        """Tokenize a list of strings."""
+        input_ids = labels = tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                max_length=max_seq_length,
+                truncation=True,
+        ).input_ids
+        input_ids_lens = labels_lens = input_ids.ne(tokenizer.pad_token_id).sum().item()
+        # print(input_ids_lens)
+
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            input_ids_lens=input_ids_lens,
+            labels_lens=labels_lens,
         )
+    
+    # 目前版本训练数据中直接包含了prompt template，而不是在分词预处理时才加入
+    def sft_data_processor(example, tokenizer, max_seq_length, skip_tokens):
 
-    if args.block_size is None:
-        block_size = tokenizer.model_max_length
-        if block_size > config.max_position_embeddings:
-            logger.warning(
-                f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). "
-                f"Using block_size={min(1024, config.max_position_embeddings)} instead. You can change that default value by passing --block_size xxx."
-            )
-            block_size = min(1024, config.max_position_embeddings)
-    else:
-        if args.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({args.block_size}) is larger than the maximum length for the model "
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(args.block_size, tokenizer.model_max_length)
+        source_text = example['text']
+        target_text = example['answer'] + tokenizer.eos_token
+        examples_tokenized = _tokenize_fn(source_text + target_text, tokenizer, max_seq_length)
+        sources_tokenized = _tokenize_fn(source_text, tokenizer, max_seq_length)
 
-    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
-    def group_texts(examples):
-        # Concatenate all texts.
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(examples.keys())[0]])
-        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
-        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
-        total_length = (total_length // block_size) * block_size
-        # Split by chunks of max_len.
-        result = {
-            k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
-            for k, t in concatenated_examples.items()
+        input_ids = examples_tokenized["input_ids"].flatten()
+        source_len = sources_tokenized["input_ids_lens"]
+        labels = copy.deepcopy(input_ids)
+        labels[ :source_len-1] = -100
+
+        # special token mask
+        if skip_tokens is not None:
+            for i, input_id_list in enumerate(input_ids):
+                for j, orig_token in enumerate(input_id_list):
+                    if orig_token in skip_tokens:
+                        labels[i][j] = -100
+
+        attention_mask = torch.ones_like(input_ids)
+
+        return {
+            'input_ids': input_ids.flatten(),
+            'labels': labels.flatten(),
+            'attention_mask': attention_mask.flatten()
         }
-        result["labels"] = result["input_ids"].copy()
-        return result
 
-    # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a remainder
-    # for each of those groups of 1,000 texts. You can adjust that batch_size here but a higher value might be slower
-    # to preprocess.
-    #
-    # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
-    # https://huggingface.co/docs/datasets/process#map
+    encode_function = partial(
+        sft_data_processor,
+        tokenizer=tokenizer,
+        max_seq_length=512,
+        skip_tokens=args.skip_tokens.split(',') if args.skip_tokens else None,
+    )
+
+    if accelerator.is_main_process:
+        logger.info('被忽略的special token：{}'.format(args.skip_tokens))
 
     with accelerator.main_process_first():
-        lm_datasets = tokenized_datasets.map(
-            group_texts,
-            batched=True,
+        sft_datasets = raw_datasets.map(
+            encode_function,
+            batched=False,
             num_proc=args.preprocessing_num_workers,
             load_from_cache_file=not args.overwrite_cache,
-            desc=f"Grouping texts in chunks of {block_size}",
+            remove_columns=[name for name in column_names if name not in ["input_ids", "labels", "attention_mask"]],
+            desc=f"making sft data with special token",
         )
 
-    train_dataset = lm_datasets["train"]
-    eval_dataset = lm_datasets["validation"]
+    train_dataset = sft_datasets["train"]
+    eval_dataset = sft_datasets["validation"]
 
-    # Log a few random samples from the training set:
+    """
+    数据示例，如果不显示，请把log level调到20
+    """
     for index in random.sample(range(len(train_dataset)), 3):
         logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-   
+
     """
-    
+    训练初始化
     """
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer)
     # DataLoaders creation:
     train_dataloader = DataLoader(
-        train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size
+        train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(
-        eval_dataset, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size
+        eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
     )
 
     # Optimizer
@@ -576,6 +590,7 @@ def main():
         },
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -605,11 +620,6 @@ def main():
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # Figure out how many steps we should save the Accelerator states
-    checkpointing_steps = args.checkpointing_steps
-    if checkpointing_steps is not None and checkpointing_steps.isdigit():
-        checkpointing_steps = int(checkpointing_steps)
-
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if args.with_tracking:
@@ -619,12 +629,11 @@ def main():
         accelerator.init_trackers("clm_no_trainer", experiment_config)
     
     """
-    开始训练
+    训练
     """
-    # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    logger.info("***** Running training *****")
+    logger.info("***** Running special token training in FAWKES loop no trainer *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
@@ -636,35 +645,6 @@ def main():
     completed_steps = 0
     starting_epoch = 0
 
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint is not None or args.resume_from_checkpoint != "":
-            checkpoint_path = args.resume_from_checkpoint
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # Get the most recent checkpoint
-            dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-            dirs.sort(key=os.path.getctime)
-            path = dirs[-1]  # Sorts folders by date modified, most recent checkpoint is the last
-            checkpoint_path = path
-            path = os.path.basename(checkpoint_path)
-
-        accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
-        accelerator.load_state(checkpoint_path)
-        # Extract `epoch_{i}` or `step_{i}`
-        training_difference = os.path.splitext(path)[0]
-
-        if "epoch" in training_difference:
-            starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-            resume_step = None
-            completed_steps = starting_epoch * num_update_steps_per_epoch
-        else:
-            # need to multiply `gradient_accumulation_steps` to reflect real steps
-            resume_step = int(training_difference.replace("step_", "")) * args.gradient_accumulation_steps
-            starting_epoch = resume_step // len(train_dataloader)
-            completed_steps = resume_step // args.gradient_accumulation_steps
-            resume_step -= starting_epoch * len(train_dataloader)
-
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
@@ -672,11 +652,8 @@ def main():
         model.train()
         if args.with_tracking:
             total_loss = 0
-        if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
-            # We skip the first `n` batches in the dataloader when resuming from a checkpoint
-            active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
-        else:
-            active_dataloader = train_dataloader
+
+        active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
                 outputs = model(**batch)
@@ -693,13 +670,9 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
+                if accelerator.is_main_process and completed_steps %5 == 1:
+                    print(f"\nstep {completed_steps} train loss: {loss.detach().float()}")
 
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    output_dir = f"step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-                    accelerator.save_state(output_dir)
             if completed_steps >= args.max_train_steps:
                 break
 
@@ -733,28 +706,6 @@ def main():
                 step=completed_steps,
             )
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                api.upload_folder(
-                    commit_message=f"Training in progress epoch {epoch}",
-                    folder_path=args.output_dir,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    token=args.hub_token,
-                )
-
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
-
     if args.with_tracking:
         accelerator.end_training()
 
@@ -766,17 +717,11 @@ def main():
         )
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                api.upload_folder(
-                    commit_message="End of training",
-                    folder_path=args.output_dir,
-                    repo_id=repo_id,
-                    repo_type="model",
-                    token=args.hub_token,
-                )
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
                 json.dump({"perplexity": perplexity}, f)
 
 
 if __name__ == "__main__":
     main()
+
+
